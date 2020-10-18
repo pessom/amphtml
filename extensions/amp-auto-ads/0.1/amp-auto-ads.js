@@ -14,55 +14,57 @@
  * limitations under the License.
  */
 
-import {AdTracker, getExistingAds} from './ad-tracker';
 import {AdStrategy} from './ad-strategy';
-import {dev, user} from '../../../src/log';
-import {xhrFor} from '../../../src/xhr';
+import {
+  AdTracker,
+  getAdConstraintsFromConfigObj,
+  getExistingAds,
+} from './ad-tracker';
+import {AnchorAdStrategy} from './anchor-ad-strategy';
+import {Attributes, getAttributesFromConfigObj} from './attributes';
+import {Services} from '../../../src/services';
+import {dict} from '../../../src/utils/object';
 import {getAdNetworkConfig} from './ad-network-config';
-import {isExperimentOn} from '../../../src/experiments';
-import {getAttributesFromConfigObj} from './attributes';
 import {getPlacementsFromConfigObj} from './placement';
+import {isExperimentOn} from '../../../src/experiments';
+import {userAssert} from '../../../src/log';
 
 /** @const */
 const TAG = 'amp-auto-ads';
 
-/**
- * The target number of ads for the page. Both existing ads and any inserted by
- * amp-auto-ads count towards this.
- * TODO: Make this configurable via the JSON config returned by the ad network.
- * @const {number}
- */
-const TARGET_AD_COUNT = 3;
-
-/**
- * The minimum distance between any two ads in pixels. Auto ads will only be
- * inserted in positions where they are estimated to be a vertical distance of
- * this or more from any other ads.
- * TODO: Make this configurable via the JSON config returned by the ad network.
- * @const {number}
- */
-const MIN_AD_SPACING = 500;
-
+/** @const */
+const AD_TAG = 'amp-ad';
 
 export class AmpAutoAds extends AMP.BaseElement {
-
   /** @override */
   buildCallback() {
-    user().assert(isExperimentOn(self, 'amp-auto-ads'), 'Experiment is off');
-
     const type = this.element.getAttribute('type');
-    user().assert(type, 'Missing type attribute');
+    userAssert(type, 'Missing type attribute');
 
-    const adNetwork = getAdNetworkConfig(type, this.element);
-    user().assert(adNetwork, 'No AdNetworkConfig for type: ' + type);
+    /** @private {?./ad-network-config.AdNetworkConfigDef} */
+    this.adNetwork_ = getAdNetworkConfig(type, this.element);
+    userAssert(this.adNetwork_, 'No AdNetworkConfig for type: ' + type);
 
-    this.getConfig_(adNetwork.getConfigUrl()).then(configObj => {
-      const placements = getPlacementsFromConfigObj(this.win, configObj);
-      const attributes = Object.assign(adNetwork.getAttributes(),
-          getAttributesFromConfigObj(configObj));
-      const adTracker = new AdTracker(getExistingAds(this.win), MIN_AD_SPACING);
-      new AdStrategy(placements, attributes, adTracker, TARGET_AD_COUNT).run();
-    });
+    if (!this.adNetwork_.isEnabled(this.win)) {
+      return;
+    }
+
+    const ampdoc = this.getAmpDoc();
+    Services.extensionsFor(this.win)./*OK*/ installExtensionForDoc(
+      ampdoc,
+      AD_TAG
+    );
+
+    /** @private {!Promise<!JsonObject>} */
+    this.configPromise_ = this.getAmpDoc()
+      .whenFirstVisible()
+      .then(() => {
+        return this.getConfig_(this.adNetwork_.getConfigUrl());
+      });
+
+    if (!this.isAutoAdsLayoutCallbackExperimentOn_()) {
+      this.placeAds_();
+    }
   }
 
   /** @override */
@@ -70,11 +72,19 @@ export class AmpAutoAds extends AMP.BaseElement {
     return true;
   }
 
+  /** @override */
+  layoutCallback() {
+    if (this.isAutoAdsLayoutCallbackExperimentOn_()) {
+      return this.placeAds_();
+    }
+    return Promise.resolve();
+  }
+
   /**
    * Tries to load an auto-ads configuration from the given URL. This uses a
    * non-credentialed request.
    * @param {string} configUrl
-   * @return {!Promise<!JSONType>}
+   * @return {!Promise<!JsonObject>}
    * @private
    */
   getConfig_(configUrl) {
@@ -83,15 +93,67 @@ export class AmpAutoAds extends AMP.BaseElement {
       mode: 'cors',
       method: 'GET',
       credentials: 'omit',
-      requireAmpResponseSourceOrigin: false,
     };
-    return xhrFor(this.win)
-        .fetchJson(configUrl, xhrInit)
-        .catch(reason => {
-          dev().error(TAG, 'amp-auto-ads config xhr failed: ' + reason);
-          return null;
-        });
+    return Services.xhrFor(this.win)
+      .fetchJson(configUrl, xhrInit)
+      .then((res) => res.json())
+      .catch((reason) => {
+        this.user().error(TAG, 'amp-auto-ads config xhr failed: ' + reason);
+        return null;
+      });
+  }
+
+  /**
+   * @return {boolean}
+   * @private
+   */
+  isAutoAdsLayoutCallbackExperimentOn_() {
+    return isExperimentOn(this.win, 'auto-ads-layout-callback');
+  }
+
+  /**
+   * @return {!Promise}
+   * @private
+   */
+  placeAds_() {
+    const ampdoc = this.getAmpDoc();
+    return this.configPromise_.then((configObj) => {
+      if (!configObj) {
+        return;
+      }
+      const noConfigReason = configObj['noConfigReason'];
+      if (noConfigReason) {
+        this.user().warn(TAG, noConfigReason);
+      }
+
+      const placements = getPlacementsFromConfigObj(ampdoc, configObj);
+      const attributes = /** @type {!JsonObject} */ (Object.assign(
+        dict({}),
+        this.adNetwork_.getAttributes(),
+        getAttributesFromConfigObj(configObj, Attributes.BASE_ATTRIBUTES)
+      ));
+      const sizing = this.adNetwork_.getSizing();
+      const adConstraints =
+        getAdConstraintsFromConfigObj(ampdoc, configObj) ||
+        this.adNetwork_.getDefaultAdConstraints();
+      const adTracker = new AdTracker(getExistingAds(ampdoc), adConstraints);
+      new AdStrategy(
+        placements,
+        attributes,
+        sizing,
+        adTracker,
+        this.adNetwork_.isResponsiveEnabled()
+      ).run();
+      const stickyAdAttributes = /** @type {!JsonObject} */ (Object.assign(
+        dict({}),
+        attributes,
+        getAttributesFromConfigObj(configObj, Attributes.STICKY_AD_ATTRIBUTES)
+      ));
+      new AnchorAdStrategy(ampdoc, stickyAdAttributes, configObj).run();
+    });
   }
 }
 
-AMP.registerElement('amp-auto-ads', AmpAutoAds);
+AMP.extension(TAG, '0.1', (AMP) => {
+  AMP.registerElement(TAG, AmpAutoAds);
+});

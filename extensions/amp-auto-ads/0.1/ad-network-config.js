@@ -14,16 +14,36 @@
  * limitations under the License.
  */
 
-import {buildUrl} from '../../../ads/google/a4a/url-builder';
-import {documentInfoForDoc} from '../../../src/document-info';
-import {parseUrl} from '../../../src/url';
+import {AdSenseNetworkConfig} from './adsense-network-config';
+import {AlrightNetworkConfig} from './alright-network-config';
+import {DenakopNetworkConfig} from './denakop-network-config';
+import {DoubleclickNetworkConfig} from './doubleclick-network-config';
+import {FirstImpressionIoConfig} from './firstimpression.io-network-config';
+import {PingNetworkConfig} from './ping-network-config';
+import {PremiumadsNetworkConfig} from './premiumads-network-config';
+import {getMode} from '../../../src/mode';
+
+/** @typedef {{width: (number|undefined), height: (number|undefined)}} */
+export let SizeInfoDef;
 
 /**
  * An interface intended to be implemented by any ad-networks wishing to support
  * amp-auto-ads.
  * @interface
  */
-class AdNetworkConfigDef {
+export class AdNetworkConfigDef {
+  /**
+   * Indicates whether amp-auto-ads should be enabled on this pageview.
+   * @param {!Window} unusedWin
+   * @return {boolean} true if amp-auto-ads should be enabled on this pageview.
+   */
+  isEnabled(unusedWin) {}
+
+  /**
+   * Indicates whether amp-auto-ads should be displayed at full-width.
+   * @return {boolean} true if amp-auto-ads full-width responsive is enabled.
+   */
+  isResponsiveEnabled() {}
 
   /**
    * @return {string}
@@ -33,9 +53,21 @@ class AdNetworkConfigDef {
   /**
    * Any attributes derived from either the page or the auto-amp-ads tag that
    * should be applied to any ads inserted.
-   * @return {!Object<string, string>}
+   * @return {!JsonObject<string, string>}
    */
   getAttributes() {}
+
+  /**
+   * Network specific constraints on the placement of ads on the page.
+   * @return {!./ad-tracker.AdConstraints}
+   */
+  getDefaultAdConstraints() {}
+
+  /**
+   * Network specific sizing information.
+   * @return {!SizeInfoDef}
+   */
+  getSizing() {}
 }
 
 /**
@@ -45,44 +77,26 @@ class AdNetworkConfigDef {
  * @return {?AdNetworkConfigDef}
  */
 export function getAdNetworkConfig(type, autoAmpAdsElement) {
+  if ((getMode().test || getMode().localDev) && type == '_ping_') {
+    return new PingNetworkConfig(autoAmpAdsElement);
+  }
   if (type == 'adsense') {
     return new AdSenseNetworkConfig(autoAmpAdsElement);
   }
+  if (type == 'alright') {
+    return new AlrightNetworkConfig(autoAmpAdsElement);
+  }
+  if (type == 'denakop') {
+    return new DenakopNetworkConfig(autoAmpAdsElement);
+  }
+  if (type == 'doubleclick') {
+    return new DoubleclickNetworkConfig(autoAmpAdsElement);
+  }
+  if (type == 'firstimpression.io') {
+    return new FirstImpressionIoConfig(autoAmpAdsElement);
+  }
+  if (type == 'premiumads') {
+    return new PremiumadsNetworkConfig(autoAmpAdsElement);
+  }
   return null;
-}
-
-/**
- * @implements {AdNetworkConfigDef}
- */
-class AdSenseNetworkConfig {
-  /**
-   * @param {!Element} autoAmpAdsElement
-   */
-  constructor(autoAmpAdsElement) {
-    this.autoAmpAdsElement_ = autoAmpAdsElement;
-  }
-
-  /** @override */
-  getConfigUrl() {
-    const docInfo = documentInfoForDoc(this.autoAmpAdsElement_);
-    const canonicalHostname = parseUrl(docInfo.canonicalUrl).hostname;
-    return buildUrl('//pagead2.googlesyndication.com/getconfig/ama', [
-      {
-        name: 'client',
-        value: this.autoAmpAdsElement_.getAttribute('data-ad-client'),
-      },
-      {
-        name: 'plah',
-        value: canonicalHostname},
-      {name: 'ama_t', value: 'amp'},
-    ], 4096);
-  }
-
-  /** @override */
-  getAttributes() {
-    return {
-      'type': 'adsense',
-      'data-ad-client': this.autoAmpAdsElement_.getAttribute('data-ad-client'),
-    };
-  }
 }

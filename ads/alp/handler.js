@@ -16,13 +16,15 @@
 
 import {
   addParamToUrl,
+  isLocalhostOrigin,
+  isProxyOrigin,
   parseQueryString,
+  parseUrlDeprecated,
 } from '../../src/url';
 import {closest, openWindowDialog} from '../../src/dom';
 import {dev} from '../../src/log';
+import {dict} from '../../src/utils/object';
 import {urls} from '../../src/config';
-import {isProxyOrigin, isLocalhostOrigin, parseUrl} from '../../src/url';
-import {startsWith} from '../../src/string';
 
 /**
  * Install a click listener that transforms navigation to the AMP cache
@@ -70,8 +72,11 @@ export function handleClick(e, opt_viewerNavigate) {
 
   // Tag the original href with &amp=1 and make it a fragment param with
   // name click.
-  const fragment = 'click=' + encodeURIComponent(
-      addParamToUrl(link.a.href, 'amp', '1', /* opt_addToFront */ true));
+  const fragment =
+    'click=' +
+    encodeURIComponent(
+      addParamToUrl(link.a.href, 'amp', '1', /* opt_addToFront */ true)
+    );
   let destination = link.eventualUrl;
   if (link.eventualUrl.indexOf('#') == -1) {
     destination += '#' + fragment;
@@ -82,8 +87,9 @@ export function handleClick(e, opt_viewerNavigate) {
   const ancestors = win.location.ancestorOrigins;
   if (ancestors && ancestors[ancestors.length - 1] == 'http://localhost:8000') {
     destination = destination.replace(
-        `${parseUrl(link.eventualUrl).host}/c/`,
-        'http://localhost:8000/max/');
+      `${parseUrlDeprecated(link.eventualUrl).host}/c/`,
+      'http://localhost:8000/max/'
+    );
   }
   e.preventDefault();
   if (opt_viewerNavigate) {
@@ -107,7 +113,7 @@ export function handleClick(e, opt_viewerNavigate) {
  * }|undefined} A URL on the AMP Cache.
  */
 function getLinkInfo(e) {
-  const a = closest(dev().assertElement(e.target), element => {
+  const a = closest(dev().assertElement(e.target), (element) => {
     return element.tagName == 'A' && element.href;
   });
   if (!a) {
@@ -131,8 +137,10 @@ function getEventualUrl(a) {
   if (!eventualUrl) {
     return;
   }
-  if (!isProxyOrigin(eventualUrl) ||
-      !startsWith(parseUrl(eventualUrl).pathname, '/c/')) {
+  if (
+    !isProxyOrigin(eventualUrl) ||
+    !parseUrlDeprecated(eventualUrl).pathname.startsWith('/c/')
+  ) {
     return;
   }
   return eventualUrl;
@@ -149,9 +157,15 @@ function navigateTo(win, a, url) {
   const target = (a.target || '_top').toLowerCase();
   const a2aAncestor = getA2AAncestor(win);
   if (a2aAncestor) {
-    a2aAncestor.win./*OK*/postMessage('a2a;' + JSON.stringify({
-      url,
-    }), a2aAncestor.origin);
+    a2aAncestor.win./*OK*/ postMessage(
+      'a2a;' +
+        JSON.stringify(
+          dict({
+            'url': url,
+          })
+        ),
+      a2aAncestor.origin
+    );
     return;
   }
   openWindowDialog(win, url, target);
@@ -168,7 +182,7 @@ export function warmupStatic(win) {
   // preconnects.
   new win.Image().src = `${urls.cdn}/preconnect.gif`;
   // Preload the primary AMP JS that is render blocking.
-  const linkRel = /*OK*/document.createElement('link');
+  const linkRel = /*OK*/ document.createElement('link');
   linkRel.rel = 'preload';
   linkRel.setAttribute('as', 'script');
   linkRel.href = `${urls.cdn}/v0.js`;
@@ -186,11 +200,19 @@ export function warmupDynamic(e) {
   if (!link || !link.eventualUrl) {
     return;
   }
-  const linkRel = /*OK*/document.createElement('link');
-  linkRel.rel = 'preload';
-  linkRel.setAttribute('as', 'document');
-  linkRel.href = link.eventualUrl;
-  getHeadOrFallback(e.target.ownerDocument).appendChild(linkRel);
+  // Preloading with empty as and newly specced value `fetch` meaning the same
+  // thing. `document` would be the right value, but this is not yet supported
+  // in browsers.
+  const linkRel0 = /*OK*/ document.createElement('link');
+  linkRel0.rel = 'preload';
+  linkRel0.href = link.eventualUrl;
+  const linkRel1 = /*OK*/ document.createElement('link');
+  linkRel1.rel = 'preload';
+  linkRel1.as = 'fetch';
+  linkRel1.href = link.eventualUrl;
+  const head = getHeadOrFallback(e.target.ownerDocument);
+  head.appendChild(linkRel0);
+  head.appendChild(linkRel1);
 }
 
 /**
@@ -222,7 +244,7 @@ export function getA2AAncestor(win) {
   }
   const top = origins[origins.length - 1];
   // Not a security property. We just check whether the
-  // viewer might support A2A. More domains can be added to whitelist
+  // viewer might support A2A. More domains can be added to allowlist
   // as needed.
   if (top.indexOf('.google.') == -1) {
     return null;
@@ -241,6 +263,7 @@ export function getA2AAncestor(win) {
  * Returns the Nth parent of the given window.
  * @param {!Window} win
  * @param {number} distance frames above us.
+ * @return {!Window}
  */
 function getNthParentWindow(win, distance) {
   let parent = win;

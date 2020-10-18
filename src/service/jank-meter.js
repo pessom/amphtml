@@ -14,15 +14,16 @@
  * limitations under the License.
  */
 
+import {Services} from '../services';
+import {TickLabel} from '../enums';
+import {dev, user} from '../log';
+import {htmlFor} from '../static-template';
 import {isExperimentOn} from '../experiments';
-import {performanceForOrNull} from '../performance';
-import {dev} from '../log';
 
 /** @const {number} */
 const NTH_FRAME = 200;
 
 export class JankMeter {
-
   /**
    * @param {!Window} win
    */
@@ -30,23 +31,32 @@ export class JankMeter {
     /** @private {!Window} */
     this.win_ = win;
     /** @private {number} */
-    this.jankCnt_ = 0;
+    this.badFrameCnt_ = 0;
     /** @private {number} */
-    this.totalCnt_ = 0;
+    this.totalFrameCnt_ = 0;
+    /** @private {number} */
+    this.longTaskChild_ = 0;
+    /** @private {number} */
+    this.longTaskSelf_ = 0;
     /** @private {?number} */
     this.scheduledTime_ = null;
     /** @private {?./performance-impl.Performance} */
-    this.perf_ = performanceForOrNull(win);
+    this.perf_ = Services.performanceForOrNull(win);
 
-    if (isJankMeterEnabled(win)) {
-      /** @private {!Element} */
-      this.jankMeterDisplay_ = this.win_.document.createElement('div');
-      this.jankMeterDisplay_.classList.add('i-amphtml-jank-meter');
-      this.win_.document.body.appendChild(this.jankMeterDisplay_);
-      this.updateMeterDisplay_(0);
-    }
+    /** @private {?BatteryManager} */
+    this.batteryManager_ = null;
+    /** @private {?number} */
+    this.batteryLevelStart_ = null;
+    this.initializeBatteryManager_();
+
+    /** @private {?PerformanceObserver} */
+    this.longTaskObserver_ = null;
+    this.initializeLongTaskObserver_();
   }
 
+  /**
+   * Callback for scheduled.
+   */
   onScheduled() {
     if (!this.isEnabled_()) {
       return;
@@ -57,56 +67,158 @@ export class JankMeter {
     }
   }
 
+  /**
+   * Callback for run.
+   */
   onRun() {
     if (!this.isEnabled_() || this.scheduledTime_ == null) {
       return;
     }
     const paintLatency = this.win_.Date.now() - this.scheduledTime_;
     this.scheduledTime_ = null;
-    this.totalCnt_++;
+    this.totalFrameCnt_++;
     if (paintLatency > 16) {
-      this.jankCnt_++;
+      this.badFrameCnt_++;
       dev().info('JANK', 'Paint latency: ' + paintLatency + 'ms');
     }
 
-    // Report Good Frame Probability on Nth frame.
-    if (this.perf_ && this.totalCnt_ == NTH_FRAME) {
-      this.perf_.tickDelta('gfp', this.calculateGfp_());
+    // Report metrics on Nth frame, so we have sort of normalized numbers.
+    if (this.perf_ && this.totalFrameCnt_ == NTH_FRAME) {
+      const gfp = this.calculateGfp_();
+      this.perf_.tickDelta(TickLabel.GOOD_FRAME_PROBABILITY, gfp);
+      this.perf_.tickDelta(TickLabel.BAD_FRAMES, this.badFrameCnt_);
+      if (this.longTaskObserver_) {
+        // lts: Long Tasks of Self frame
+        this.perf_.tickDelta(TickLabel.LONG_TASKS_SELF, this.longTaskSelf_);
+        // ltc: Long Tasks of Child frames
+        this.perf_.tickDelta(TickLabel.LONG_TASKS_CHILD, this.longTaskChild_);
+        this.longTaskObserver_.disconnect();
+        this.longTaskObserver_ = null;
+      }
+      let batteryDrop = 0;
+      if (this.batteryManager_ && this.batteryLevelStart_ != null) {
+        batteryDrop = this.win_.Math.max(
+          0,
+          this.win_.Math.floor(
+            this.batteryManager_.level * 100 - this.batteryLevelStart_
+          )
+        );
+        this.perf_.tickDelta(TickLabel.BATTERY_DROP, batteryDrop);
+      }
       this.perf_.flush();
+      if (isJankMeterEnabled(this.win_)) {
+        this.displayMeterDisplay_(batteryDrop);
+      }
     }
-    if (isJankMeterEnabled(this.win_)) {
-      this.updateMeterDisplay_(paintLatency);
-    }
-  }
-
-  isEnabled_() {
-    return isJankMeterEnabled(this.win_)
-        || (this.perf_
-            && this.perf_.isPerformanceTrackingOn()
-            && this.totalCnt_ < NTH_FRAME);
   }
 
   /**
-   * @param {number} paintLatency
+   * Returns if is enabled
+   *
+   * @return {?boolean}
+   */
+  isEnabled_() {
+    return (
+      isJankMeterEnabled(this.win_) ||
+      (this.perf_ &&
+        this.perf_.isPerformanceTrackingOn() &&
+        this.totalFrameCnt_ < NTH_FRAME)
+    );
+  }
+
+  /**
+   * @param {number} batteryDrop
    * @private
    */
-  updateMeterDisplay_(paintLatency) {
-    const gfp = this.calculateGfp_();
-    this.jankMeterDisplay_.textContent =
-        `${gfp}%|${this.totalCnt_}|${paintLatency}ms`;
+  displayMeterDisplay_(batteryDrop) {
+    const doc = this.win_.document;
+    const display = htmlFor(doc)`
+      <div class="i-amphtml-jank-meter"></div>`;
+    display.textContent =
+      `bf:${this.badFrameCnt_}, lts: ${this.longTaskSelf_}, ` +
+      `ltc:${this.longTaskChild_}, bd:${batteryDrop}`;
+    doc.body.appendChild(display);
   }
 
   /**
    * Calculate Good Frame Probability, which is a value range from 0 to 100.
-   * @returns {number}
+   * @return {number}
    * @private
    */
   calculateGfp_() {
     return this.win_.Math.floor(
-        (this.totalCnt_ - this.jankCnt_) / this.totalCnt_ * 100);
+      ((this.totalFrameCnt_ - this.badFrameCnt_) / this.totalFrameCnt_) * 100
+    );
+  }
+
+  /**
+   * Initializes long task observer.
+   */
+  initializeLongTaskObserver_() {
+    if (!this.isEnabled_() || !isLongTaskApiSupported(this.win_)) {
+      return;
+    }
+    this.longTaskObserver_ = new this.win_.PerformanceObserver((entryList) => {
+      const entries = entryList.getEntries();
+      for (let i = 0; i < entries.length; i++) {
+        if (entries[i].entryType == 'longtask') {
+          // longtask is any task with duration of bigger than 50ms
+          // we sum up the number of 50ms a task spans.
+          const span = this.win_.Math.floor(entries[i].duration / 50);
+          if (entries[i].name == 'cross-origin-descendant') {
+            this.longTaskChild_ += span;
+            user().info(
+              'LONGTASK',
+              `from child frame ${entries[i].duration}ms`
+            );
+          } else {
+            this.longTaskSelf_ += span;
+            dev().info('LONGTASK', `from self frame ${entries[i].duration}ms`);
+          }
+        }
+      }
+    });
+    this.longTaskObserver_.observe({entryTypes: ['longtask']});
+  }
+
+  /**
+   * Initializes battery manager.
+   */
+  initializeBatteryManager_() {
+    if (isBatteryApiSupported(this.win_)) {
+      this.win_.navigator.getBattery().then((battery) => {
+        this.batteryManager_ = battery;
+        this.batteryLevelStart_ = battery.level * 100;
+      });
+    }
   }
 }
 
+/**
+ * @param {!Window} win
+ * @return {boolean}
+ */
 function isJankMeterEnabled(win) {
   return isExperimentOn(win, 'jank-meter');
+}
+
+/**
+ * @param {!Window} win
+ * @return {boolean}
+ */
+export function isLongTaskApiSupported(win) {
+  return (
+    !!win.PerformanceObserver &&
+    !!win['TaskAttributionTiming'] &&
+    'containerName' in win['TaskAttributionTiming'].prototype
+  );
+}
+
+/**
+ * @param {!Window} unusedWin
+ * @return {boolean}
+ */
+function isBatteryApiSupported(unusedWin) {
+  // TODO: (@lannka, #9749)
+  return false;
 }

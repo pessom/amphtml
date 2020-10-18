@@ -14,24 +14,32 @@
  * limitations under the License.
  */
 
+import {ScrollManager} from './scroll-manager';
+import {Services} from '../../../src/services';
 import {
-  closestBySelector,
+  closestAncestorElementBySelector,
+  getDataParamsFromAttributes,
   matches,
   scopedQuerySelector,
 } from '../../../src/dom';
-import {dev, user} from '../../../src/log';
+import {dev, user, userAssert} from '../../../src/log';
+import {getMode} from '../../../src/mode';
+import {isArray} from '../../../src/types';
+import {isExperimentOn} from '../../../src/experiments';
+import {layoutRectLtwh} from '../../../src/layout-rect';
 import {map} from '../../../src/utils/object';
-import {whenContentIniLoad} from '../../../src/friendly-iframe-embed';
+import {provideVisibilityManager} from './visibility-manager';
+import {tryResolve} from '../../../src/utils/promise';
+import {whenContentIniLoad} from '../../../src/ini-load';
 
-const TAG = 'amp-analytics';
-
+const TAG = 'amp-analytics/analytics-root';
+const VARIABLE_DATA_ATTRIBUTE_KEY = /^vars(.+)/;
 
 /**
  * An analytics root. Analytics can be scoped to either ampdoc, embed or
  * an arbitrary AMP element.
  *
- * TODO(dvoytenko): consider moving this concept into core as `AmpRoot`
- * interface that will be implemented by `AmpDoc` and `FriendlyIframeEmbed`.
+ * TODO(#22733): merge analytics root properties into ampdoc.
  *
  * @implements {../../../src/service.Disposable}
  * @abstract
@@ -39,17 +47,19 @@ const TAG = 'amp-analytics';
 export class AnalyticsRoot {
   /**
    * @param {!../../../src/service/ampdoc-impl.AmpDoc} ampdoc
-   * @param {?AnalyticsRoot} parent
    */
-  constructor(ampdoc, parent) {
+  constructor(ampdoc) {
     /** @const */
     this.ampdoc = ampdoc;
 
     /** @const */
-    this.parent = parent;
-
-    /** @const */
     this.trackers_ = map();
+
+    /** @private {?./visibility-manager.VisibilityManager} */
+    this.visibilityManager_ = null;
+
+    /** @private {?./scroll-manager.ScrollManager} */
+    this.scrollManager_ = null;
   }
 
   /** @override */
@@ -57,6 +67,12 @@ export class AnalyticsRoot {
     for (const k in this.trackers_) {
       this.trackers_[k].dispose();
       delete this.trackers_[k];
+    }
+    if (this.visibilityManager_) {
+      this.visibilityManager_.dispose();
+    }
+    if (this.scrollManager_) {
+      this.scrollManager_.dispose();
     }
   }
 
@@ -70,10 +86,18 @@ export class AnalyticsRoot {
   /**
    * The root node the analytics is scoped to.
    *
-   * @return {!Document|!ShadowRoot|!Element}
+   * @return {!Document|!ShadowRoot}
    * @abstract
    */
   getRoot() {}
+
+  /**
+   * The viewer of analytics root
+   * @return {!../../../src/service/viewer-interface.ViewerInterface}
+   */
+  getViewer() {
+    return Services.viewerForDoc(this.ampdoc);
+  }
 
   /**
    * The root element within the analytics root.
@@ -82,7 +106,11 @@ export class AnalyticsRoot {
    */
   getRootElement() {
     const root = this.getRoot();
-    return dev().assertElement(root.documentElement || root.body || root);
+    // In the case of a shadow doc, its host will be used as
+    // a refrence point
+    return dev().assertElement(
+      root.host || root.documentElement || root.body || root
+    );
   }
 
   /**
@@ -121,11 +149,26 @@ export class AnalyticsRoot {
   getElementById(unusedId) {}
 
   /**
+   * Returns the tracker for the specified name and list of allowed types.
+   *
+   * @param {string} name
+   * @param {!Object<string, typeof ./events.EventTracker>} allowlist
+   * @return {?./events.EventTracker}
+   */
+  getTrackerForAllowlist(name, allowlist) {
+    const trackerProfile = allowlist[name];
+    if (trackerProfile) {
+      return this.getTracker(name, trackerProfile);
+    }
+    return null;
+  }
+
+  /**
    * Returns the tracker for the specified name and type. If the tracker
    * has not been requested before, it will be created.
    *
    * @param {string} name
-   * @param {function(new:./events.EventTracker, !AnalyticsRoot)} klass
+   * @param {typeof ./events.CustomEventTracker|typeof ./events.ClickEventTracker|typeof ./events.ScrollEventTracker|typeof ./events.SignalTracker|typeof ./events.IniLoadTracker|typeof ./events.VideoEventTracker|typeof ./events.VideoEventTracker|typeof ./events.VisibilityTracker|typeof ./events.AmpStoryEventTracker} klass
    * @return {!./events.EventTracker}
    */
   getTracker(name, klass) {
@@ -154,32 +197,117 @@ export class AnalyticsRoot {
    * @param {string} selector DOM query selector.
    * @param {?string=} selectionMethod Allowed values are `null`,
    *   `'closest'` and `'scope'`.
-   * @return {?Element} Element corresponding to the selector if found.
+   * @return {!Promise<!Element>} Element corresponding to the selector.
    */
   getElement(context, selector, selectionMethod = null) {
     // Special case selectors. The selection method is irrelavant.
+    // And no need to wait for document ready.
     if (selector == ':root') {
-      return this.getRootElement();
+      return tryResolve(() => this.getRootElement());
     }
     if (selector == ':host') {
-      return this.getHostElement();
+      return new Promise((resolve) => {
+        resolve(
+          user().assertElement(
+            this.getHostElement(),
+            `Element "${selector}" not found`
+          )
+        );
+      });
     }
 
-    // Query search based on the selection method.
-    let found;
-    if (selectionMethod == 'scope') {
-      found = scopedQuerySelector(context, selector);
-    } else if (selectionMethod == 'closest') {
-      found = closestBySelector(context, selector);
-    } else {
-      found = this.getRoot().querySelector(selector);
+    // Wait for document-ready to avoid false missed searches
+    return this.ampdoc.whenReady().then(() => {
+      let found;
+      let result = null;
+      // Query search based on the selection method.
+      try {
+        if (selectionMethod == 'scope') {
+          found = scopedQuerySelector(context, selector);
+        } else if (selectionMethod == 'closest') {
+          found = closestAncestorElementBySelector(context, selector);
+        } else {
+          found = this.getRoot().querySelector(selector);
+        }
+      } catch (e) {
+        userAssert(false, `Invalid query selector ${selector}`);
+      }
+
+      // DOM search can "look" outside the boundaries of the root, thus make
+      // sure the result is contained.
+      if (found && this.contains(found)) {
+        result = found;
+      }
+      return user().assertElement(result, `Element "${selector}" not found`);
+    });
+  }
+
+  /**
+   * @param {!Array<string>} selectors Array of DOM query selectors.
+   * @return {!Promise<!Array<!Element>>} Element corresponding to the selector.
+   */
+  getElementsByQuerySelectorAll_(selectors) {
+    // Wait for document-ready to avoid false missed searches
+    return this.ampdoc.whenReady().then(() => {
+      let elements = [];
+      for (let i = 0; i < selectors.length; i++) {
+        let nodeList;
+        let elementArray = [];
+        const selector = selectors[i];
+        try {
+          nodeList = this.getRoot().querySelectorAll(selector);
+        } catch (e) {
+          userAssert(false, `Invalid query selector ${selector}`);
+        }
+        for (let j = 0; j < nodeList.length; j++) {
+          if (this.contains(nodeList[j])) {
+            elementArray.push(nodeList[j]);
+          }
+        }
+        elementArray = this.getDataVarsElements_(elementArray, selector);
+        userAssert(elementArray.length, `Element "${selector}" not found`);
+        elements = elements.concat(elementArray);
+      }
+      // Return unique
+      return elements.filter(
+        (element, index) => elements.indexOf(element) === index
+      );
+    });
+  }
+
+  /**
+   * Return all elements that have a data-vars attribute.
+   * @param {!Array<!Element>} elementArray
+   * @param {string} selector
+   * @return {!Array<!Element>}
+   */
+  getDataVarsElements_(elementArray, selector) {
+    let removedCount = 0;
+    const dataVarsArray = [];
+    for (let i = 0; i < elementArray.length; i++) {
+      const dataVarKeys = Object.keys(
+        getDataParamsFromAttributes(
+          elementArray[i],
+          /* computeParamNameFunc */ undefined,
+          VARIABLE_DATA_ATTRIBUTE_KEY
+        )
+      );
+      if (dataVarKeys.length) {
+        dataVarsArray.push(elementArray[i]);
+      } else {
+        removedCount++;
+      }
     }
-    // DOM search can "look" outside the boundaries of the root, thus make
-    // sure the result is contained.
-    if (found && this.contains(found)) {
-      return found;
+    if (removedCount) {
+      user().warn(
+        TAG,
+        '%s element(s) ommited from selector "%s"' +
+          ' because no data-vars-* attribute was found.',
+        removedCount,
+        selector
+      );
     }
-    return null;
+    return dataVarsArray;
   }
 
   /**
@@ -190,19 +318,61 @@ export class AnalyticsRoot {
    * @param {string} selector DOM query selector.
    * @param {?string=} selectionMethod Allowed values are `null`,
    *   `'closest'` and `'scope'`.
-   * @return {?AmpElement} AMP element corresponding to the selector if found.
+   * @return {!Promise<!AmpElement>} AMP element corresponding to the selector if found.
    */
   getAmpElement(context, selector, selectionMethod) {
-    const element = this.getElement(context, selector, selectionMethod);
-    if (element) {
-      // TODO(dvoytenko, #6794): Remove old `-amp-element` form after the new
-      // form is in PROD for 1-2 weeks.
-      user().assert(
-          (element.classList.contains('-amp-element')
-            || element.classList.contains('i-amphtml-element')),
-          'Element "%s" is required to be an AMP element', selector);
+    return this.getElement(context, selector, selectionMethod).then(
+      (element) => {
+        this.verifyAmpElements_([element], selector);
+        return element;
+      }
+    );
+  }
+
+  /**
+   * Searches for the element(s) that matches the selector
+   * within the scope of the analytics root in relationship to
+   * the specified context node.
+   *
+   * @param {!Element} context
+   * @param {!Array<string>|string} selectors DOM query selector(s).
+   * @param {?string=} selectionMethod Allowed values are `null`,
+   *   `'closest'` and `'scope'`.
+   * @return {!Promise<!Array<!Element>>} Array of elements corresponding to the selector if found.
+   */
+  getElements(context, selectors, selectionMethod) {
+    if (
+      isExperimentOn(this.ampdoc.win, 'visibility-trigger-improvements') &&
+      isArray(selectors)
+    ) {
+      userAssert(
+        !selectionMethod,
+        'Cannot have selectionMethod %s defined with an array selector.',
+        selectionMethod
+      );
+      return this.getElementsByQuerySelectorAll_(
+        /** @type {!Array<string>} */ (selectors)
+      );
     }
-    return element;
+    return this.getElement(
+      context,
+      /** @type {string} */ (selectors),
+      selectionMethod
+    ).then((element) => [element]);
+  }
+
+  /**
+   * @param {!Array<Element>} elements
+   * @param {string} selector
+   */
+  verifyAmpElements_(elements, selector) {
+    for (let i = 0; i < elements.length; i++) {
+      userAssert(
+        elements[i].classList.contains('i-amphtml-element'),
+        'Element "%s" is required to be an AMP element',
+        selector
+      );
+    }
   }
 
   /**
@@ -218,9 +388,8 @@ export class AnalyticsRoot {
    *   `'closest'` and `'scope'`.
    * @return {function(!Event)}
    */
-  createSelectiveListener(
-      listener, context, selector, selectionMethod = null) {
-    return event => {
+  createSelectiveListener(listener, context, selector, selectionMethod = null) {
+    return (event) => {
       if (selector == ':host') {
         // `:host` is not reachable via selective listener b/c event path
         // cannot be retargeted across the boundary of the embed.
@@ -229,18 +398,20 @@ export class AnalyticsRoot {
 
       // Navigate up the DOM tree to find the actual target.
       const rootElement = this.getRootElement();
-      const isSelectAny = (selector == '*');
-      const isSelectRoot = (selector == ':root');
-      let target = event.target;
+      const isSelectAny = selector == '*';
+      const isSelectRoot = selector == ':root';
+      let {target} = event;
       while (target) {
-
         // Target must be contained by this root.
         if (!this.contains(target)) {
           break;
         }
         // `:scope` context must contain the target.
-        if (selectionMethod == 'scope' &&
-            !isSelectRoot && !context.contains(target)) {
+        if (
+          selectionMethod == 'scope' &&
+          !isSelectRoot &&
+          !context.contains(target)
+        ) {
           break;
         }
         // `closest()` target must contain the conext.
@@ -251,9 +422,11 @@ export class AnalyticsRoot {
         }
 
         // Check if the target matches the selector.
-        if (isSelectAny ||
-            isSelectRoot && target == rootElement ||
-            matchesNoInline(target, selector)) {
+        if (
+          isSelectAny ||
+          (isSelectRoot && target == rootElement) ||
+          tryMatches_(target, selector)
+        ) {
           listener(target, event);
           // Don't fire the event multiple times even if the more than one
           // ancestor matches the selector.
@@ -272,8 +445,35 @@ export class AnalyticsRoot {
    * @abstract
    */
   whenIniLoaded() {}
-}
 
+  /**
+   * Returns the visibility root corresponding to this analytics root (ampdoc
+   * or embed). The visibility root is created lazily as needed and takes
+   * care of all visibility tracking functions.
+   * @return {!./visibility-manager.VisibilityManager}
+   */
+  getVisibilityManager() {
+    if (!this.visibilityManager_) {
+      this.visibilityManager_ = provideVisibilityManager(this.getRoot());
+    }
+    return this.visibilityManager_;
+  }
+
+  /**
+   *  Returns the Scroll Managet corresponding to this analytics root.
+   * The Scroll Manager is created lazily as needed, and will handle
+   * calling all handlers for a scroll event.
+   * @return {!./scroll-manager.ScrollManager}
+   */
+  getScrollManager() {
+    // TODO (zhouyx@): Disallow scroll trigger with host API
+    if (!this.scrollManager_) {
+      this.scrollManager_ = new ScrollManager(this);
+    }
+
+    return this.scrollManager_;
+  }
+}
 
 /**
  * The implementation of the analytics root for an ampdoc.
@@ -283,7 +483,7 @@ export class AmpdocAnalyticsRoot extends AnalyticsRoot {
    * @param {!../../../src/service/ampdoc-impl.AmpDoc} ampdoc
    */
   constructor(ampdoc) {
-    super(ampdoc, /* parent */ null);
+    super(ampdoc);
   }
 
   /** @override */
@@ -314,22 +514,35 @@ export class AmpdocAnalyticsRoot extends AnalyticsRoot {
 
   /** @override */
   whenIniLoaded() {
-    return whenContentIniLoad(this.ampdoc, this.ampdoc.win);
+    const viewport = Services.viewportForDoc(this.ampdoc);
+    let rect;
+    if (getMode(this.ampdoc.win).runtime == 'inabox') {
+      // TODO(dvoytenko, #7971): This is currently addresses incorrect position
+      // calculations in a in-a-box viewport where all elements are offset
+      // to the bottom of the embed. The current approach, even if fixed, still
+      // creates a significant probability of risk condition.
+      // Once address, we can simply switch to the 0/0 approach in the `else`
+      // clause.
+      rect = viewport.getLayoutRect(this.getRootElement());
+    } else {
+      const size = viewport.getSize();
+      rect = layoutRectLtwh(0, 0, size.width, size.height);
+    }
+    return whenContentIniLoad(this.ampdoc, this.ampdoc.win, rect);
   }
 }
 
-
 /**
  * The implementation of the analytics root for FIE.
+ * TODO(#22733): merge into AnalyticsRoot once ampdoc-fie is launched.
  */
 export class EmbedAnalyticsRoot extends AnalyticsRoot {
   /**
    * @param {!../../../src/service/ampdoc-impl.AmpDoc} ampdoc
    * @param {!../../../src/friendly-iframe-embed.FriendlyIframeEmbed} embed
-   * @param {?AnalyticsRoot} parent
    */
-  constructor(ampdoc, embed, parent) {
-    super(ampdoc, parent);
+  constructor(ampdoc, embed) {
+    super(ampdoc);
     /** @const */
     this.embed = embed;
   }
@@ -365,13 +578,13 @@ export class EmbedAnalyticsRoot extends AnalyticsRoot {
   }
 }
 
-
 /**
  * @param  {!Element} el
- * @param  {!string} selector
+ * @param  {string} selector
  * @return {boolean}
+ * @noinline
  */
-function matchesNoInline(el, selector) {
+function tryMatches_(el, selector) {
   try {
     return matches(el, selector);
   } catch (e) {
